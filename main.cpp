@@ -19,6 +19,9 @@ bool AreSlocCharacters(const char* first, const char* end) {
 	const char* initial_end = end;
 
 	first = function::SkipWhitespace(first);
+	if (first > end) {
+		return false;
+	}
 	Stream<char> line_contents = { first, function::PointerDifference(end, first) };
 
 	while (first < end) {
@@ -51,6 +54,7 @@ size_t GetSloc(Stream<char> content, CapacityStream<unsigned int> new_line_posit
 		if (first_char_non_space == last_line_character) {
 			sloc_count--;
 			current_character = last_line_character_offset + 1;
+			return;
 		}
 
 		// Check for non parenthese line
@@ -61,6 +65,7 @@ size_t GetSloc(Stream<char> content, CapacityStream<unsigned int> new_line_posit
 
 	for (unsigned int index = 0; index < new_line_positions.size; index++) {
 		last_line_character_offset = new_line_positions[index];
+		verify_line();
 	}
 
 	last_line_character_offset = content.size;
@@ -76,9 +81,9 @@ struct LineCountThreadTaskData {
 	std::atomic<size_t>* total_line_count;
 	Semaphore* semaphore;
 	// Per thread
-	CapacityStream<char>* error_message;
+	CapacityStream<char>** error_message;
 	// Per thread
-	CapacityStream<char>* additional_display_message;
+	CapacityStream<char>** additional_display_message;
 	bool display_per_file_count;
 };
 
@@ -110,26 +115,26 @@ ECS_THREAD_TASK(LineCountThreadTask) {
 		ECS_FILE_HANDLE file_handle = 0;
 		unsigned int offset = data->thread_partitions[thread_id].offset;
 
-		ECS_FORMAT_STRING(data->error_message[thread_id], "\nThread {#} errors:\n", thread_id);
+		ECS_FORMAT_STRING(*data->error_message[thread_id], "\nThread {#} errors:\n", thread_id);
 		size_t errors = 0;
 
 		size_t thread_sloc = 0;
 
 		if (data->display_per_file_count) {
-			ECS_FORMAT_STRING(data->additional_display_message[thread_id], "\nThread {#} additional information:\n", thread_id);
+			ECS_FORMAT_STRING(*data->additional_display_message[thread_id], "\nThread {#} additional information:\n", thread_id);
 		}
 
 		for (unsigned int index = 0; index < data->thread_partitions[thread_id].size; index++) {
 			Stream<wchar_t> current_path = data->files->buffer[offset + index];
 			ECS_FILE_STATUS_FLAGS file_status = OpenFile(current_path, &file_handle, ECS_FILE_ACCESS_READ_ONLY | ECS_FILE_ACCESS_OPTIMIZE_SEQUENTIAL
-				| ECS_FILE_ACCESS_TEXT, &data->error_message[thread_id]);
+				| ECS_FILE_ACCESS_TEXT, data->error_message[thread_id]);
 			// If the opening succeded, try to read the whole file into a memory buffer
 			if (file_status == ECS_FILE_STATUS_OK) {
 				file_buffer.size = DEFAULT_BUFFER_SIZE;
 				unsigned int bytes_read = ReadFromFile(file_handle, file_buffer);
 				if (bytes_read == -1) {
 					ECS_FORMAT_TEMP_STRING(temp_message, "Reading from {#} failed.\n", current_path);
-					data->error_message[thread_id].AddStreamSafe(temp_message);
+					data->error_message[thread_id]->AddStreamSafe(temp_message);
 					errors++;
 				}
 				else {
@@ -143,13 +148,13 @@ ECS_THREAD_TASK(LineCountThreadTask) {
 					size_t sloc = GetSloc(file_buffer, file_new_line_positions);
 					if (sloc == -1) {
 						ECS_FORMAT_TEMP_STRING(temp_message, "Parsing {#} failed. Possible problems: invalid multi-line comments.\n", current_path);
-						data->error_message[thread_id].AddStreamSafe(temp_message);
+						data->error_message[thread_id]->AddStreamSafe(temp_message);
 					}
 					else {
 						thread_sloc += sloc;
 						if (data->display_per_file_count) {
 							ECS_FORMAT_TEMP_STRING(temp_message, "File {#} has {#} sloc.\n", current_path, sloc);
-							data->additional_display_message[thread_id].AddStreamSafe(temp_message);
+							data->additional_display_message[thread_id]->AddStreamSafe(temp_message);
 						}
 					}
 				}
@@ -158,13 +163,17 @@ ECS_THREAD_TASK(LineCountThreadTask) {
 				CloseFile(file_handle);
 			}
 			else {
-				data->error_message[thread_id].AddSafe('\n');
+				data->error_message[thread_id]->AddSafe('\n');
 				errors++;
 			}
 		}
 	
 		if (errors == 0) {
-			data->error_message[thread_id].size = 0;
+			data->error_message[thread_id]->size = 0;
+		}
+
+		if (data->display_per_file_count) {
+			ECS_FORMAT_STRING(*data->additional_display_message[thread_id], "Total line count for thread {#}.\n", thread_sloc);
 		}
 
 		free(file_buffer.buffer);
@@ -303,16 +312,24 @@ int main(int argc, char** argv) {
 	const size_t COUNT_ERROR_MESSAGE_CAPACITY = ECS_KB * 16;
 	const size_t ADDITIONAL_MESSAGE_ALLOCATION_CAPACITY = ECS_KB * 64;
 
-	ECS_STACK_CAPACITY_STREAM_DYNAMIC(CapacityStream<char>, per_thread_error_message, thread_count);
-	ECS_STACK_CAPACITY_STREAM_DYNAMIC(CapacityStream<char>, per_thread_additional_message, thread_count);
+	// Allocate the capacity streams separately in order to avoid false sharing
+	void* message_allocation = ECS_STACK_ALLOC(ECS_CACHE_LINE_SIZE * thread_count * 2 + ECS_CACHE_LINE_SIZE);
+	message_allocation = function::AlignPointer(message_allocation, ECS_CACHE_LINE_SIZE);
+	ECS_STACK_CAPACITY_STREAM_DYNAMIC(CapacityStream<char>*, per_thread_error_message, thread_count);
+	ECS_STACK_CAPACITY_STREAM_DYNAMIC(CapacityStream<char>*, per_thread_additional_message, thread_count);
 
 	for (unsigned int index = 0; index < thread_count; index++) {
-		per_thread_error_message[index] = { task_manager.AllocateTempBuffer(index, COUNT_ERROR_MESSAGE_CAPACITY), 0, COUNT_ERROR_MESSAGE_CAPACITY };
+		per_thread_error_message[index] = (CapacityStream<char>*)message_allocation;
+		message_allocation = function::OffsetPointer(message_allocation, ECS_CACHE_LINE_SIZE);
+		*per_thread_error_message[index] = { task_manager.AllocateTempBuffer(index, COUNT_ERROR_MESSAGE_CAPACITY), 0, COUNT_ERROR_MESSAGE_CAPACITY };
+
+		per_thread_additional_message[index] = (CapacityStream<char>*)message_allocation;
+		message_allocation = function::OffsetPointer(message_allocation, ECS_CACHE_LINE_SIZE);
 		if (display_per_file_sloc) {
-			per_thread_additional_message[index] = { task_manager.AllocateTempBuffer(index, ADDITIONAL_MESSAGE_ALLOCATION_CAPACITY), 0, ADDITIONAL_MESSAGE_ALLOCATION_CAPACITY };
+			*per_thread_additional_message[index] = { task_manager.AllocateTempBuffer(index, ADDITIONAL_MESSAGE_ALLOCATION_CAPACITY), 0, ADDITIONAL_MESSAGE_ALLOCATION_CAPACITY };
 		}
 		else {
-			per_thread_additional_message[index] = { nullptr, 0, 0 };
+			*per_thread_additional_message[index] = { nullptr, 0, 0 };
 		}
 	}
 
@@ -350,14 +367,14 @@ int main(int argc, char** argv) {
 	printf("%s", line_message.buffer);
 
 	for (unsigned int index = 0; index < thread_count; index++) {
-		if (per_thread_error_message[index].size > 0) {
-			per_thread_error_message[index][per_thread_error_message[index].size] = '\0';
-			printf("%s\n\n", per_thread_error_message[index].buffer);
+		if (per_thread_error_message[index]->size > 0) {
+			per_thread_error_message[index]->buffer[per_thread_error_message[index]->size] = '\0';
+			printf("%s\n\n", per_thread_error_message[index]->buffer);
 		}
 
-		if (per_thread_additional_message[index].size > 0) {
-			per_thread_additional_message[index][per_thread_additional_message[index].size] = '\0';
-			printf("%s\n\n", per_thread_additional_message[index].buffer);
+		if (per_thread_additional_message[index]->size > 0) {
+			per_thread_additional_message[index]->buffer[per_thread_additional_message[index]->size] = '\0';
+			printf("%s\n\n", per_thread_additional_message[index]->buffer);
 		}
 	}
 
@@ -372,14 +389,14 @@ int main(int argc, char** argv) {
 		}
 
 		for (unsigned int index = 0; index < thread_count; index++) {
-			if (per_thread_error_message[index].size > 0) {
-				if (!WriteFile(output_file, per_thread_error_message[index])) {
+			if (per_thread_error_message[index]->size > 0) {
+				if (!WriteFile(output_file, *per_thread_error_message[index])) {
 					printf("Writing into output file error message failed.\n");
 				}
 			}
 
-			if (per_thread_additional_message[index].size > 0) {
-				if (!WriteFile(output_file, { per_thread_additional_message[index] })) {
+			if (per_thread_additional_message[index]->size > 0) {
+				if (!WriteFile(output_file, { *per_thread_additional_message[index] })) {
 					printf("Writing into output file additional thread messages failed.\n");
 				}
 			}
